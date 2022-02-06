@@ -1,6 +1,6 @@
 use std::{
-    sync::mpsc::{channel, Receiver, Sender},
-    thread::{self, JoinHandle},
+    sync::{mpsc::{channel}, Arc, atomic::{AtomicBool, Ordering}},
+    thread::{self},
 };
 
 use arrayvec::ArrayVec;
@@ -12,6 +12,8 @@ use tak::{
     turn::Turn,
 };
 
+use rayon::prelude::*;
+
 use crate::{
     agent::{Agent, Batcher},
     example::{Example, IncompleteExample},
@@ -20,8 +22,8 @@ use crate::{
     turn_map::Lut,
 };
 
-const SELF_PLAY_GAMES: usize = 4000;
-const ROLLOUTS_PER_MOVE: u32 = 2000;
+const SELF_PLAY_GAMES: usize = 2000;
+const ROLLOUTS_PER_MOVE: u32 = 1000;
 const OPENING_PLIES: usize = 6;
 
 /// Run multiple games against self.
@@ -44,99 +46,80 @@ where
     [[Option<Tile>; N]; N]: Default,
     Turn<N>: Lut,
 {
-    const WORKERS: usize = 4;
-    println!("Starting self-play with {WORKERS} workers");
+    const SIMUL_GAMES: usize = 6;
+    println!("Starting self-play with {SIMUL_GAMES} simulatenous games");
 
-    fn new_worker<const N: usize>(
-        tx: Sender<Vec<Example<N>>>,
-        receivers: &mut ArrayVec<Receiver<Game<N>>, WORKERS>,
-        transmitters: &mut ArrayVec<Sender<(Vec<f32>, f32)>, WORKERS>,
-        overwrite: Option<usize>,
-    ) -> JoinHandle<()>
-    where
-        [[Option<Tile>; N]; N]: Default,
-        Turn<N>: Lut,
-    {
+    // setup agents
+    let mut agents = Vec::with_capacity(SIMUL_GAMES);
+    let mut receivers: ArrayVec<_, SIMUL_GAMES> = ArrayVec::new();
+    let mut senders: ArrayVec<_, SIMUL_GAMES> = ArrayVec::new();
+    let (examples_tx, examples_rx) = channel();
+    let should_play = Arc::new(AtomicBool::new(true));
+    for _ in 0..SIMUL_GAMES {
         let (game_tx, game_rx) = channel();
         let (policy_tx, policy_rx) = channel();
-        if let Some(i) = overwrite {
-            receivers[i] = game_rx;
-            transmitters[i] = policy_tx;
-        } else {
-            receivers.push(game_rx);
-            transmitters.push(policy_tx);
+        receivers.push(game_rx);
+        senders.push(policy_tx);
+        agents.push((Batcher::new(game_tx, policy_rx), examples_tx.clone(), should_play.clone()));
+    }
+    
+    // start game playing thread
+    thread::spawn(move || agents.into_par_iter().for_each(|(agent, tx, should_play)| {
+        while should_play.load(Ordering::Relaxed) {
+            tx.send(self_play_game(&agent)).unwrap()
         }
-        let batcher = Batcher::new(game_tx, policy_rx);
-        thread::spawn(move || {
-            tx.send(self_play_game(&batcher)).unwrap();
-        })
-    }
-
-    // initialize worker threads
-    let mut workers: ArrayVec<_, WORKERS> = ArrayVec::new();
-    let mut receivers: ArrayVec<_, WORKERS> = ArrayVec::new();
-    let mut transmitters: ArrayVec<_, WORKERS> = ArrayVec::new();
-    let (examples_tx, examples_rx) = channel();
-    for _ in 0..WORKERS {
-        workers.push(new_worker(
-            examples_tx.clone(),
-            &mut receivers,
-            &mut transmitters,
-            None,
-        ));
-    }
+    }));
 
     let mut completed_games = 0;
-    let mut done_threads = [false; WORKERS];
-    while completed_games < SELF_PLAY_GAMES || workers.iter().any(|handle| handle.is_running()) {
+    let mut total_examples = Vec::new();
+    let mut communicators: ArrayVec<_, SIMUL_GAMES> = ArrayVec::new();
+    let mut batch: ArrayVec<_, SIMUL_GAMES> = ArrayVec::new();
+
+    let mut average_batch_size = 0.;
+    let mut n = 0;
+    while completed_games < SELF_PLAY_GAMES {
         // collect game states
-        let mut communicators: ArrayVec<_, WORKERS> = ArrayVec::new();
-        let mut batch: ArrayVec<_, WORKERS> = ArrayVec::new();
         for (i, rx) in receivers.iter().enumerate() {
             if let Ok(game) = rx.try_recv() {
                 communicators.push(i);
                 batch.push(game);
             }
         }
-        if batch.is_empty() {
-            println!("empty batch!");
-            continue;
-        }
 
-        // run prediction
-        let (policies, evals) = network.policy_eval_batch(&batch);
+        if !batch.is_empty() {
+            average_batch_size = (average_batch_size * n as f32 + batch.len() as f32) / (n + 1) as f32;
+            n += 1;
 
-        // send out outputs
-        for (i, r) in communicators
-            .into_iter()
-            .zip(policies.into_iter().zip(evals.into_iter()))
-        {
-            transmitters[i].send(r).unwrap();
-        }
+            // run prediction
+            let (policies, evals) = network.policy_eval_batch(&batch);
 
-        for (i, handle) in workers.iter_mut().enumerate() {
-            // track when threads finish
-            if !handle.is_running() && !done_threads[i] {
-                completed_games += 1;
-                println!("self-play game {completed_games}/{SELF_PLAY_GAMES}");
-                // start a new thread when one finishes
-                if completed_games < SELF_PLAY_GAMES - WORKERS {
-                    *handle = new_worker(examples_tx.clone(), &mut receivers, &mut transmitters, Some(i));
-                } else {
-                    done_threads[i] = true;
-                }
+            // send out outputs
+            for (&i, r) in communicators
+                .iter()
+                .zip(policies.into_iter().zip(evals.into_iter()))
+            {
+                senders[i].send(r).unwrap();
             }
+
+            communicators.clear();
+            batch.clear();
+        }
+
+        // collect examples
+        while let Ok(examples) = examples_rx.try_recv() {
+            completed_games += 1;
+            println!("self-play game {completed_games}/{SELF_PLAY_GAMES}");
+            println!("average batch size {average_batch_size:.3} with n={n}");
+            total_examples.extend(examples.into_iter());
+        }
+
+        // stop starting new games
+        if completed_games > SELF_PLAY_GAMES - SIMUL_GAMES {
+            should_play.store(false, Ordering::Relaxed);
         }
     }
 
-    // collect examples
-    examples_rx
-        .iter()
-        .take(completed_games)
-        .fold(Vec::new(), |mut a, b| {
-            a.extend(b.into_iter());
-            a
-        })
+    total_examples
 }
 
 /// Run a single game against self.
