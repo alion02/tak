@@ -76,8 +76,6 @@ async fn main() {
                             break;
                         }
 
-                        println!("My turn");
-
                         let start = Instant::now();
                         while Instant::now().duration_since(start) < Duration::from_secs(20) {
                             player.rollout(&game, 200);
@@ -122,7 +120,6 @@ async fn main() {
                 };
 
                 loop {
-                    println!("Opponent's turn");
                     match playtak_game.update().await.unwrap() {
                         GameUpdate::Played(m) => {
                             println!("Opponent played {m}");
