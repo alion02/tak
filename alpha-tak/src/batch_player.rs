@@ -125,8 +125,6 @@ where
 
         let mut node = self.node.lock().unwrap();
 
-        node.rollout(game.clone(), self.network); // at least one rollout
-
         // save example
         self.examples.push(IncompleteExample {
             game: game.clone(),
