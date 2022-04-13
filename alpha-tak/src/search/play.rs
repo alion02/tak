@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, thread::spawn, time::Instant};
 
 use rand_distr::{Distribution, WeightedIndex};
 use tak::*;
@@ -24,9 +24,62 @@ impl<const N: usize> Node<N> {
     #[must_use]
     pub fn play(mut self, turn: &Turn<N>) -> Node<N> {
         self.check_initialized();
-        self.children
+        let child = self
+            .children
             .remove(turn)
-            .expect("attempted to play invalid move")
+            .expect("attempted to play invalid move");
+
+        spawn(move || {
+            fn verify_invariants<const N: usize>(node: &Node<N>) {
+                assert_eq!(node.virtual_visits, 0);
+                match node.visits {
+                    0 => {
+                        assert_eq!(node.result, GameResult::Ongoing);
+                        assert_eq!(node.children.len(), 0);
+                    }
+                    _ => {
+                        assert!((node.result == GameResult::Ongoing) ^ (node.children.len() == 0));
+                    }
+                }
+                node.children.values().for_each(verify_invariants);
+            }
+
+            fn count_nodes<const N: usize>(node: &Node<N>) -> u64 {
+                node.children.values().map(count_nodes).sum::<u64>() + 1
+            }
+
+            fn count_single_visit<const N: usize>(node: &Node<N>) -> u64 {
+                if node.visits == 1 {
+                    1
+                } else {
+                    node.children.values().map(count_single_visit).sum()
+                }
+            }
+
+            verify_invariants(&self);
+
+            let to_drop_nodes = count_nodes(&self);
+            let single_visit_nodes = count_single_visit(&self);
+
+            println!(
+                "{} nodes to be dropped\n{} rollouts\n{} single visit",
+                to_drop_nodes, self.visits, single_visit_nodes
+            );
+
+            let start = Instant::now();
+
+            drop(self);
+
+            let time = start.elapsed();
+            println!(
+                "Deallocated nodes: {} in {}ms ({}/ms)",
+                to_drop_nodes,
+                time.as_millis(),
+                to_drop_nodes as f64 / (time.as_secs_f64() * 1000.0)
+            );
+        });
+
+        child
     }
 
     pub fn pick_move(&self, exploitation: bool) -> Turn<N> {
