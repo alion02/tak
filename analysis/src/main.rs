@@ -16,6 +16,10 @@ use clap::Parser;
 use cli::Args;
 use tak::*;
 
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
+use mimalloc::MiMalloc;
+
 mod cli;
 
 fn main() {
