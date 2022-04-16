@@ -37,7 +37,7 @@ fn main() {
     if let Some(file_path) = args.ptn_file {
         let content = read_to_string(file_path).expect("get good scrub");
         let turns = Vec::<Turn<N>>::from_ptn(&content).expect("idk bozo");
-        let analysis = analysis_for_file(&network, turns, args.batch_size);
+        let analysis = analysis_for_file(network, turns, args.batch_size, args.pipeline_depth);
 
         if let Ok(mut file) = File::create("analysis.ptn") {
             file.write_all(analysis.to_ptn().as_bytes()).unwrap();
@@ -48,7 +48,14 @@ fn main() {
     }
 
     let mut game = Game::<N>::with_komi(KOMI);
-    let mut player = BatchPlayer::new(&game, &network, vec![], game.komi, args.batch_size);
+    let mut player = BatchPlayer::new(
+        &game,
+        network,
+        vec![],
+        game.komi,
+        args.batch_size,
+        args.pipeline_depth,
+    );
 
     while matches!(game.winner(), GameResult::Ongoing) {
         // Get input from user.
@@ -92,7 +99,7 @@ fn get_input() -> String {
     line
 }
 
-fn try_play_move(player: &mut BatchPlayer<'_, 5>, game: &mut Game<5>, input: String) -> StrResult<()> {
+fn try_play_move(player: &mut BatchPlayer<5>, game: &mut Game<5>, input: String) -> StrResult<()> {
     let turn = Turn::from_ptn(&input)?;
     let mut copy = game.clone();
     copy.play(turn.clone())?;
@@ -100,9 +107,14 @@ fn try_play_move(player: &mut BatchPlayer<'_, 5>, game: &mut Game<5>, input: Str
     game.play(turn)
 }
 
-fn analysis_for_file(network: &Network<N>, turns: Vec<Turn<N>>, batch_size: u32) -> Analysis<N> {
+fn analysis_for_file(
+    network: Network<N>,
+    turns: Vec<Turn<N>>,
+    batch_size: usize,
+    pipeline_depth: usize,
+) -> Analysis<N> {
     let mut game = Game::with_komi(KOMI);
-    let mut player = BatchPlayer::new(&game, network, vec![], game.komi, batch_size);
+    let mut player = BatchPlayer::new(&game, network, vec![], game.komi, batch_size, pipeline_depth);
 
     for turn in turns {
         println!("Analysing {}", turn.to_ptn());

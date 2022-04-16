@@ -20,6 +20,8 @@ pub struct Network<const N: usize> {
     pub fully_connected_eval: nn::Linear,
 }
 
+unsafe impl<const N: usize> Sync for Network<N> {}
+
 impl<const N: usize> Network<N> {
     pub fn save<T: AsRef<Path>>(&self, path: T) -> Result<(), Box<dyn Error>> {
         self.vs.save(path)?;

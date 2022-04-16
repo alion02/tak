@@ -1,13 +1,6 @@
-use std::{
-    ops::DerefMut,
-    sync::{
-        mpsc::{channel, Receiver, Sender},
-        Arc,
-        Mutex,
-    },
-    thread::spawn,
-};
+use std::{collections::VecDeque, sync::Arc, thread::spawn};
 
+use crossbeam::channel::{bounded, Receiver, Sender};
 use tak::*;
 
 use crate::{
@@ -17,101 +10,120 @@ use crate::{
     search::{node::Node, turn_map::Lut},
 };
 
-pub struct BatchPlayer<'a, const N: usize> {
-    node: Arc<Mutex<Node<N>>>,
-    network: &'a Network<N>,
+pub struct BatchPlayer<const N: usize> {
+    node: Node<N>,
+    network: Arc<Network<N>>,
+    batch_size: usize,
+    pipeline_depth: usize,
+    work_tx: Sender<(Vec<Game<N>>, Sender<(Vec<Vec<f32>>, Vec<f32>)>)>,
+    batch_queue: VecDeque<(Vec<Vec<Turn<N>>>, Receiver<(Vec<Vec<f32>>, Vec<f32>)>)>,
     examples: Vec<IncompleteExample<N>>,
     analysis: Analysis<N>,
-    request_tx: Sender<(Game<N>, u32)>,
-    response_rx: Receiver<(Vec<Vec<Turn<N>>>, Vec<Game<N>>)>,
-    batch: u32,
 }
 
-impl<'a, const N: usize> BatchPlayer<'a, N>
+impl<const N: usize> BatchPlayer<N>
 where
     Turn<N>: Lut,
 {
-    fn request_batch(&self, game: &Game<N>) {
-        self.request_tx.send((game.clone(), self.batch)).unwrap();
+    fn send_work(&mut self, game: &Game<N>) {
+        let (paths, games): (Vec<_>, Vec<_>) = (0..self.batch_size)
+            .filter_map(|_| {
+                let mut path = vec![];
+                let mut game = game.clone();
+                if self.node.virtual_rollout(&mut game, &mut path) == GameResult::Ongoing {
+                    Some((path, game))
+                } else {
+                    None
+                }
+            })
+            .unzip();
+
+        let (tx, rx) = bounded(1);
+        self.work_tx.send((games, tx)).unwrap();
+        self.batch_queue.push_back((paths, rx));
     }
 
-    fn consume_batch(&self) {
-        let (paths, games) = self.response_rx.recv().unwrap();
+    fn fill_pipeline(&mut self, game: &Game<N>) {
+        for _ in 0..self.pipeline_depth - self.batch_queue.len() {
+            self.send_work(game);
+        }
+    }
 
-        let (policy_vecs, evals) = if games.is_empty() {
-            Default::default()
-        } else {
-            self.network.policy_eval_batch(games.as_slice())
-        };
+    fn process_batch(&mut self) {
+        let (paths, batch_rx) = self.batch_queue.pop_front().unwrap();
+        let (policy_vecs, evals) = batch_rx.recv().unwrap();
 
-        let mut node = self.node.lock().unwrap();
         policy_vecs
             .into_iter()
             .zip(evals)
             .zip(paths)
             .for_each(|(result, path)| {
-                node.devirtualize_path(&mut path.into_iter(), &result);
+                self.node.devirtualize_path(&mut path.into_iter(), &result);
             });
+    }
+
+    fn process_pipeline(&mut self) {
+        while !self.batch_queue.is_empty() {
+            self.process_batch();
+        }
     }
 
     pub fn new(
         game: &Game<N>,
-        network: &'a Network<N>,
+        network: Network<N>,
         opening: Vec<Turn<N>>,
         komi: i32,
-        batch: u32,
+        batch_size: usize,
+        pipeline_depth: usize,
     ) -> Self {
-        let (request_tx, request_rx) = channel();
-        let (response_tx, response_rx) = channel();
+        let network = Arc::new(network);
+        let (work_tx, work_rx) = bounded::<(Vec<_>, Sender<_>)>(pipeline_depth);
 
-        let instance = Self {
+        for _ in 0..pipeline_depth {
+            let network = network.clone();
+            let work_rx = work_rx.clone();
+            spawn(move || {
+                while let Ok((games, batch_tx)) = work_rx.recv() {
+                    batch_tx
+                        .send(if games.is_empty() {
+                            Default::default()
+                        } else {
+                            network.policy_eval_batch(games.as_slice())
+                        })
+                        .unwrap();
+                }
+            });
+        }
+
+        let mut instance = Self {
             node: Default::default(),
             network,
+            batch_size,
+            pipeline_depth,
+            work_tx,
+            batch_queue: Default::default(),
             examples: Vec::new(),
             analysis: Analysis::from_opening(opening, komi),
-            request_tx,
-            response_rx,
-            batch,
         };
 
-        let node = instance.node.clone();
-        spawn(move || {
-            while let Ok((game, batch)) = request_rx.recv() {
-                let mut node = node.lock().unwrap();
-                let paths: (Vec<_>, Vec<_>) = (0..batch)
-                    .filter_map(|_| {
-                        let mut path = vec![];
-                        let mut game = game.clone();
-                        if node.virtual_rollout(&mut game, &mut path) == GameResult::Ongoing {
-                            Some((path, game))
-                        } else {
-                            None
-                        }
-                    })
-                    .unzip();
-
-                response_tx.send(paths).unwrap();
-            }
-        });
-
-        instance.request_batch(game);
+        instance.fill_pipeline(game);
 
         instance
     }
 
     pub fn debug(&self, limit: Option<usize>) -> String {
-        self.node.lock().unwrap().debug(limit)
+        self.node.debug(limit)
     }
 
     /// Do a batch of rollouts.
     pub fn rollout(&mut self, game: &Game<N>) {
-        self.request_batch(game);
-        self.consume_batch();
+        self.send_work(game);
+        self.process_batch();
     }
 
     /// Pick a move to play and also play it.
     pub fn pick_move(&mut self, game: &Game<N>, exploitation: bool) -> Turn<N> {
-        let turn = self.node.lock().unwrap().pick_move(exploitation);
+        let turn = self.node.pick_move(exploitation);
         self.play_move(game, &turn);
         turn
     }
@@ -121,24 +133,22 @@ where
         // rollout stale paths
         // necessary to update policies accordingly
         // TODO: avoid rolling out nodes that are going to be discarded
-        self.consume_batch();
-
-        let mut node = self.node.lock().unwrap();
+        self.process_pipeline();
 
         // save example
         self.examples.push(IncompleteExample {
             game: game.clone(),
-            policy: node.improved_policy(),
+            policy: self.node.improved_policy(),
         });
 
-        self.analysis.update(&node, turn.clone());
+        self.analysis.update(&self.node, turn.clone());
 
-        *node = std::mem::take(node.deref_mut()).play(turn);
+        self.node = std::mem::take(&mut self.node).play(turn);
 
         // refill queue
         let mut game = game.clone();
         game.play(turn.clone()).unwrap();
-        self.request_batch(&game);
+        self.fill_pipeline(&game);
     }
 
     /// Complete collected examples with the game result and return them.
@@ -154,7 +164,10 @@ where
                 ..
             } => -1.,
             GameResult::Draw { .. } => 0.,
-            GameResult::Ongoing { .. } => unreachable!("cannot complete examples with ongoing game"),
+            GameResult::Ongoing { .. } => unreachable!(
+                "cannot complete examples
+    with ongoing game"
+            ),
         };
         std::mem::take(&mut self.examples)
             .into_iter()
@@ -176,8 +189,7 @@ where
 
     /// Apply dirichlet noise to the top node
     pub fn apply_dirichlet(&mut self, game: &Game<N>, alpha: f32, ratio: f32) {
-        let mut node = self.node.lock().unwrap();
-        node.rollout(game.clone(), self.network);
-        node.apply_dirichlet(alpha, ratio);
+        self.node.rollout(game.clone(), self.network.as_ref());
+        self.node.apply_dirichlet(alpha, ratio);
     }
 }
